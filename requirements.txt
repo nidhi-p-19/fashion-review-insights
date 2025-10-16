@@ -12,6 +12,12 @@ sentence-transformers>=3.0.0  # embeddings & similarity
 scikit-learn>=1.4.0   # metrics (precision, recall, F1)
 bert-score>=0.3.13    # semantic summary evaluation
 python-dotenv
+sentence-transformers>=3.0.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
+# Optional (for keyword salience)
+keybert>=0.8.5
+
 
 
 

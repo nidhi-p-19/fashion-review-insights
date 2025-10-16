@@ -2,34 +2,33 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import pandas as pd
 import os
+import pandas as pd
 import streamlit as st
 
-# --- read API key (works on Streamlit Cloud + locally) ---
+# ------------------ API KEY (Cloud + Local) ------------------
 GEMINI_API_KEY = None
-# 1) Streamlit Cloud (secrets)
 if "GEMINI_API_KEY" in st.secrets:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-# 2) local fallback (env var)
 elif os.getenv("GEMINI_API_KEY"):
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not GEMINI_API_KEY:
-    st.error("Missing GEMINI_API_KEY. Add it in Streamlit 'Secrets' or set it as an env var locally.")
+    st.error("🔐 Missing GEMINI_API_KEY. Add it in Streamlit (⋮ → Edit secrets) or as a local env var.")
     st.stop()
 
-
+# ------------------ CONSTANTS ------------------
 FIXED_ATTRS = ["silhouette","proportion_or_fit","detail","color","print_or_pattern","fabric"]
 ATTR_LABELS = {
-    "silhouette":"Silhouette",
-    "proportion_or_fit":"Proportion / Fit",
-    "detail":"Detail",
-    "color":"Color",
-    "print_or_pattern":"Print / Pattern",
-    "fabric":"Fabric",
+    "silhouette": "Silhouette",
+    "proportion_or_fit": "Proportion / Fit",
+    "detail": "Detail",
+    "color": "Color",
+    "print_or_pattern": "Print / Pattern",
+    "fabric": "Fabric",
 }
 
+# ------------------ PROMPTS ------------------
 SYSTEM_PROMPT = (
     "You are an expert NLP pipeline that extracts structured insights from product reviews.\n"
     "Return ONLY strict JSON. Use ONLY these attributes: silhouette, proportion_or_fit, detail, color, print_or_pattern, fabric."
@@ -59,6 +58,18 @@ Map common synonyms (A-line/boxy/flowy→silhouette; true to size/runs small→p
 Output limits:
 - For each attribute, return at most 3 evidence_snippets. Each snippet must be <= 12 tokens.
 
+### Step 5.1 Evidence sentences (REQUIRED FOR RANKING)
+Also return a top-level field "sentences" (array). Each item must be:
+{{
+  "sentence": "verbatim sentence from the reviews",
+  "pairs": [
+    {{"attribute":"silhouette|proportion_or_fit|detail|color|print_or_pattern|fabric",
+      "snippet":"<=12 tokens, verbatim",
+      "score": 1|-1|0}}
+  ]
+}}
+Include only sentences that mention at least one of the six attributes.
+
 ### Step 6. Output JSON schema
 {{
  "product_id": "{style_number}",
@@ -70,6 +81,10 @@ Output limits:
    {{"name":"color",...}},
    {{"name":"print_or_pattern",...}},
    {{"name":"fabric",...}}
+ ],
+ "sentences": [
+   {{"sentence":"...", "pairs":[{{"attribute":"fabric","snippet":"...", "score":1}}]}},
+   {{"sentence":"...", "pairs":[{{"attribute":"color","snippet":"...", "score":-1}}]}}
  ]
 }}
 
@@ -79,12 +94,14 @@ Output limits:
 Return ONLY valid JSON — no markdown.
 """
 
-# ================== DATA HELPERS ==================
+# ------------------ DATA HELPERS ------------------
 def load_reviews_df(path: str, sheet: Optional[str] = None) -> pd.DataFrame:
     """
     Reads CSV or XLSX. If sheet is None for XLSX, reads ALL sheets and concatenates.
-    Keeps a __sheet__ column for debugging.
+    Keeps a __sheet__ column.
     """
+    if not path:
+        raise ValueError("No input file path provided.")
     if path.lower().endswith(".csv"):
         df = pd.read_csv(path)
         df["__sheet__"] = "csv"
@@ -95,10 +112,11 @@ def load_reviews_df(path: str, sheet: Optional[str] = None) -> pd.DataFrame:
             for sh_name, sh_df in all_sheets.items():
                 if sh_df is None or sh_df.empty:
                     continue
+                sh_df = sh_df.copy()
                 sh_df["__sheet__"] = str(sh_name)
                 frames.append(sh_df)
             if not frames:
-                raise ValueError("No non-empty sheets found in workbook.")
+                raise ValueError("No non-empty sheets found.")
             df = pd.concat(frames, ignore_index=True)
         else:
             df = pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
@@ -117,33 +135,30 @@ def load_reviews_df(path: str, sheet: Optional[str] = None) -> pd.DataFrame:
 
 def to_review_records(df: pd.DataFrame, max_reviews: int = 80) -> List[Dict]:
     def norm(s): return " ".join(str(s or "").split())
-    recs = []
+    out = []
     for _, r in df.head(max_reviews).iterrows():
-        recs.append({
+        out.append({
             "style_number": str(r.get("style_number","")),
             "headline": norm(r.get("headline",""))[:400],
             "rating": int(r.get("rating",0)) if pd.notna(r.get("rating")) else 0,
             "comments": norm(r.get("comments",""))[:1200],
         })
-    return recs
+    return out
 
 def make_user_prompt(style_number: str, reviews: List[Dict]) -> str:
-    block = json.dumps(reviews, ensure_ascii=False, indent=2)
-    return USER_PROMPT_TEMPLATE.format(style_number=style_number, reviews_block=block)
+    return USER_PROMPT_TEMPLATE.format(
+        style_number=style_number,
+        reviews_block=json.dumps(reviews, ensure_ascii=False, indent=2)
+    )
 
-# ================== GEMINI CALLER (ROBUST) ==================
+# ------------------ GEMINI CALLER ------------------
 def call_gemini(system_prompt: str, user_prompt: str, model: str = "gemini-2.0-flash") -> str:
     import google.generativeai as genai
     from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing GEMINI_API_KEY")
-
-    genai.configure(api_key=api_key)
+    genai.configure(api_key=GEMINI_API_KEY)
     model_obj = genai.GenerativeModel(model)
 
-    # backward-compatible safety (SDKs differ in enum names)
     try:
         safety = {
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
@@ -180,16 +195,15 @@ def call_gemini(system_prompt: str, user_prompt: str, model: str = "gemini-2.0-f
             text = "".join(getattr(p, "text", "") for p in parts if getattr(p, "text", None))
 
     if not text:
-        tighter = user_prompt + "\n\nReturn compact JSON. Limit evidence_snippets to 2 per attribute."
-        prompt2 = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{tighter}"
-        resp2 = _gen(prompt2, 1600)
-        text = getattr(resp2, "text", None)
+        # tighter retry
+        retry_user = user_prompt + "\n\nReturn compact JSON. Limit evidence_snippets to 2 per attribute."
+        text = getattr(_gen(f"SYSTEM:\n{system_prompt}\n\nUSER:\n{retry_user}", 1600), "text", None)
 
     if not text:
-        raise ValueError("Gemini returned no text (token limit). Lower max reviews or use batching.")
+        raise ValueError("Gemini returned no text. Reduce max reviews or use batching.")
     return text
 
-# ================== BATCH MAP–MERGE ==================
+# ------------------ BATCH MAP–MERGE ------------------
 BATCH_SIZE = 60
 
 def summarize_batch(style_number: str, batch_reviews: list, model: str) -> dict:
@@ -197,15 +211,17 @@ def summarize_batch(style_number: str, batch_reviews: list, model: str) -> dict:
     return json.loads(raw)
 
 def merge_batches(batch_outputs: list) -> dict:
-    merged = {"product_id":"", "overall_summary":"", "attributes":[]}
+    merged = {"product_id":"", "overall_summary":"", "attributes":[], "sentences":[]}
     acc = {n: {"name": n, "mentions":0, "positive":0, "negative":0, "neutral":0,
                "net_sentiment":0.0, "summary_bullets":[], "evidence_snippets":[]} for n in FIXED_ATTRS}
+    all_sentences = []
+
     for out in batch_outputs:
         if not merged["product_id"]:
             merged["product_id"] = out.get("product_id","")
         for a in out.get("attributes", []):
             t = acc.get(a.get("name"))
-            if not t:
+            if not t: 
                 continue
             t["mentions"] += a.get("mentions",0)
             t["positive"] += a.get("positive",0)
@@ -217,10 +233,17 @@ def merge_batches(batch_outputs: list) -> dict:
             for b in (a.get("summary_bullets") or []):
                 if len(t["summary_bullets"]) < 3:
                     t["summary_bullets"].append(b)
+        for s in out.get("sentences") or []:
+            # keep a reasonable cap to avoid huge memory
+            if len(all_sentences) < 1200:
+                all_sentences.append(s)
+
     for t in acc.values():
         m = max(1, t["mentions"])
         t["net_sentiment"] = round((t["positive"] - t["negative"]) / m, 3)
         merged["attributes"].append(t)
+
+    merged["sentences"] = all_sentences
     return merged
 
 def batch_pipeline(style_number: str, reviews: list, model: str) -> dict:
@@ -238,7 +261,7 @@ def batch_pipeline(style_number: str, reviews: list, model: str) -> dict:
             merged["overall_summary"] = bullets[0][:300]
     return merged
 
-# ================== UI HELPERS ==================
+# ------------------ UI HELPERS ------------------
 def sentiment_emoji(net: float) -> str:
     return "🟢" if net >= 0.25 else ("🔴" if net <= -0.25 else "🟡")
 
@@ -247,7 +270,7 @@ def recompute_net(a: Dict) -> float:
     return round((int(a.get("positive",0)) - int(a.get("negative",0))) / m, 3)
 
 def attribute_order(attrs: List[Dict]) -> List[Dict]:
-    by = {a.get("name"): a for a in attrs}
+    by = {a.get("name"): a for a in attrs or []}
     ordered = [by.get(n, {"name":n,"mentions":0,"positive":0,"negative":0,"neutral":0,"net_sentiment":0.0,"summary_bullets":[],"evidence_snippets":[]}) for n in FIXED_ATTRS]
     return sorted(ordered, key=lambda x: -(x.get("mentions",0) or 0))
 
@@ -269,9 +292,10 @@ def onepager_md(payload: dict, attr: Optional[dict], avg_rating: Optional[float]
         for q in (attr.get("evidence_snippets") or [])[:6]: lines.append(f"> {q}")
     return "\n".join(lines)
 
-# ================== STREAMLIT PAGE ==================
+# ------------------ STREAMLIT PAGE ------------------
 st.set_page_config(page_title="Customers say (live)", page_icon="🛍️", layout="wide")
 st.title("Customers say — Live (LLM)")
+os.makedirs("live_outputs", exist_ok=True)
 
 # ---------- SIDEBAR ----------
 with st.sidebar:
@@ -280,57 +304,49 @@ with st.sidebar:
     excel_path = None
     if excel_file:
         excel_path = "uploaded_reviews.tmp.xlsx"
-        with open(excel_path, "wb") as f: f.write(excel_file.getbuffer())
+        with open(excel_path, "wb") as f:
+            f.write(excel_file.getbuffer())
     else:
-        default_guess = [p for p in Path(".").glob("*.xlsx")]
-        excel_path = str(default_guess[0]) if default_guess else None
+        guess = [p for p in Path(".").glob("*.xlsx")]
+        excel_path = str(guess[0]) if guess else None
 
-    # sheet picker (default = All)
     sheet_choice = None
     if excel_path and excel_path.lower().endswith((".xlsx",".xls")):
         try:
             xls = pd.ExcelFile(excel_path, engine="openpyxl")
             names = xls.sheet_names
-            sheet_pick = st.selectbox("Pick a sheet (or 'All')", ["All"] + names, index=0)
-            if sheet_pick != "All":
-                sheet_choice = sheet_pick
+            pick = st.selectbox("Pick a sheet (or 'All')", ["All"] + names, index=0)
+            if pick != "All":
+                sheet_choice = pick
         except Exception:
             pass
 
     style_number = st.text_input("style_number", value="")
     max_reviews = st.slider("max reviews", 20, 200, 80, 10)
     model = st.selectbox("Gemini model", ["gemini-2.0-flash","gemini-2.0-flash-lite","gemini-2.5-flash"], index=0)
+
+    st.markdown("---")
+    enable_ranking = st.toggle("Enable ranked representative quotes (embeddings)", value=True,
+                               help="Ranks Top-3 quotes per attribute by centrality+relevance.")
+    rank_method = st.selectbox("Ranking method", ["weighted","rrf"], index=0, disabled=not enable_ranking)
+
     st.caption("Tip: use 2.0-flash for stability; lower max reviews if you hit token limits.")
     run_btn = st.button("Generate summary")
 
-# ---------- SESSION STORAGE ----------
-# cache the last payload so chip clicks don't require pressing the button again
-if "payload" not in st.session_state:
-    st.session_state["payload"] = None
-if "payload_key" not in st.session_state:
-    st.session_state["payload_key"] = None
-if "avg_rating" not in st.session_state:
-    st.session_state["avg_rating"] = None
-if "n_reviews" not in st.session_state:
-    st.session_state["n_reviews"] = None
+# ---------- SESSION ----------
+for k in ["payload","payload_key","avg_rating","n_reviews","ranked"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
 
-# identify current input combo (used to invalidate cache)
-current_key = (
-    excel_path or "",
-    sheet_choice or "ALL",
-    str(style_number or ""),
-    int(max_reviews),
-    model,
-)
+current_key = (excel_path or "", sheet_choice or "ALL", str(style_number or ""), int(max_reviews), model, enable_ranking, rank_method)
 
-# require button only on first ever run
 if not st.session_state["payload"] and not run_btn:
-    st.info("Upload your Excel/CSV, optionally pick a sheet, enter a style_number, then click **Generate summary**.")
+    st.info("Upload Excel/CSV, pick a sheet (optional), enter a style_number, then click **Generate summary**.")
     st.stop()
 
 need_new_run = run_btn or (st.session_state["payload_key"] != current_key)
 
-# ---------- LOAD + FILTER + CALL LLM (when needed) ----------
+# ---------- LLM CALL ----------
 if need_new_run:
     try:
         df = load_reviews_df(excel_path, sheet=sheet_choice)
@@ -340,12 +356,12 @@ if need_new_run:
     sdf = df[df["style_number"].astype(str).str.strip() == str(style_number)]
     if sdf.empty:
         st.error(f"No rows for style_number={style_number}. "
-                 f"Hint: it may be on a different sheet — choose 'All' or pick the correct sheet.")
+                 f"Hint: try another sheet or choose 'All'.")
         st.stop()
 
     records = to_review_records(sdf, max_reviews=max_reviews)
     st.caption(f"Using {len(records)} reviews for product {style_number} "
-               f"(from sheets: {', '.join(sorted(sdf['__sheet__'].unique()))})")
+               f"(sheets: {', '.join(sorted(sdf['__sheet__'].unique()))})")
 
     avg_rating = float(sdf["rating"].dropna().astype(float).mean()) if sdf["rating"].notna().any() else None
     n_reviews = int(len(sdf)) if len(sdf) else None
@@ -359,41 +375,45 @@ if need_new_run:
     except Exception as e:
         st.exception(e); st.stop()
 
-    Path("live_outputs").mkdir(exist_ok=True)
-    json_path = Path("live_outputs") / f"summary_{style_number}.json"
-    with open(json_path, "w", encoding="utf-8") as f: json.dump(payload, f, ensure_ascii=False, indent=2)
-    st.success(f"Saved JSON → {json_path.as_posix()}")
+    # save JSON
+    out_path = Path("live_outputs") / f"summary_{style_number}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    st.success(f"Saved JSON → {out_path.as_posix()}")
 
-    st.session_state["payload"] = payload
-    st.session_state["payload_key"] = current_key
-    st.session_state["avg_rating"] = avg_rating
-    st.session_state["n_reviews"] = n_reviews
+    st.session_state.update({
+        "payload": payload,
+        "payload_key": current_key,
+        "avg_rating": avg_rating,
+        "n_reviews": n_reviews,
+        "ranked": None
+    })
 else:
     payload = st.session_state["payload"]
     avg_rating = st.session_state["avg_rating"]
     n_reviews = st.session_state["n_reviews"]
 
-# ---------- PERSIST ATTRIBUTE SELECTION ----------
-pid = str(payload.get("product_id", ""))
+# ---------- RANKING (optional) ----------
+from ranking import rank_attribute_snippets
 
-if "selected_attr" not in st.session_state:
-    st.session_state["selected_attr"] = None
-if "prev_pid" not in st.session_state:
-    st.session_state["prev_pid"] = None
-if st.session_state["prev_pid"] != pid:
-    st.session_state["selected_attr"] = None
-    st.session_state["prev_pid"] = pid
-
-def _set_attr(name: str):
-    st.session_state["selected_attr"] = name
+sentences_block = payload.get("sentences", []) if payload else []
+ranked_map = None
+if enable_ranking and sentences_block:
+    ranked_map = {}
+    for attr in FIXED_ATTRS:
+        ranked_map[attr] = rank_attribute_snippets(
+            sentences_block, attribute=attr, top_k=3,
+            method=rank_method, w_central=0.6, w_relevance=0.4
+        )
+st.session_state["ranked"] = ranked_map
 
 # ---------- RENDER ----------
+pid = str(payload.get("product_id", "")) if payload else ""
 with st.container(border=True):
     st.write((payload.get("overall_summary") or "").strip())
 
 attrs = attribute_order(payload.get("attributes", []))
 cols = st.columns(len(FIXED_ATTRS))
-
 for i, a in enumerate(attrs[:len(FIXED_ATTRS)]):
     name = a.get("name")
     label = ATTR_LABELS.get(name, name.title())
@@ -401,21 +421,16 @@ for i, a in enumerate(attrs[:len(FIXED_ATTRS)]):
     net = recompute_net(a)
     icon = sentiment_emoji(net)
     tip = f"{label}\nMentions: {m}\n+ {a.get('positive',0)} / - {a.get('negative',0)} / 0 {a.get('neutral',0)}"
-    cols[i].button(
-        f"{icon} {label} · {m}",
-        key=f"chip_{pid}_{name}",
-        help=tip,
-        on_click=_set_attr,
-        args=(name,),
-    )
+    if st.button(f"{icon} {label} · {m}", key=f"chip_{pid}_{name}", help=tip):
+        st.session_state["selected_attr"] = name
 
 st.markdown("---")
 
-selected_attr_name = st.session_state["selected_attr"]
-if not selected_attr_name:
+if "selected_attr" not in st.session_state or not st.session_state["selected_attr"]:
     st.caption("Select an attribute chip above to see details.")
     st.stop()
 
+selected_attr_name = st.session_state["selected_attr"]
 a = next((x for x in attrs if x.get("name") == selected_attr_name), None)
 label = ATTR_LABELS.get(selected_attr_name, selected_attr_name.title())
 st.subheader(label)
@@ -435,13 +450,24 @@ st.progress(pos/tot)
 st.caption(f"Positive: {pos}  |  Negative: {neg}")
 
 bullets = (a.get("summary_bullets") or [])[:3]
-quotes  = (a.get("evidence_snippets") or [])[:6]
 if bullets:
     st.markdown("### Summary")
-    for b in bullets: st.markdown(f"- {b}")
-if quotes:
-    st.markdown("### Representative quotes")
-    for q in quotes: st.write(f"“{q}”")
+    for b in bullets:
+        st.markdown(f"- {b}")
+
+st.markdown("### Representative quotes")
+ranked_items = (st.session_state.get("ranked") or {}).get(selected_attr_name) if enable_ranking else None
+if ranked_items:
+    for it in ranked_items:
+        s = "✅" if it["sentiment"] == 1 else ("❌" if it["sentiment"] == -1 else "🟣")
+        st.markdown(f"- {s} *{it['snippet']}*  \n  <small>score={it['final_score']:.3f}</small>", unsafe_allow_html=True)
+else:
+    quotes = (a.get("evidence_snippets") or [])[:6]
+    if quotes:
+        for q in quotes:
+            st.write(f"“{q}”")
+    else:
+        st.write("_No representative quotes available._")
 
 st.download_button(
     "⬇️ Download one-pager (Markdown)",
