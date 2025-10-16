@@ -1,13 +1,24 @@
-import json, os
+import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import pandas as pd
+import os
 import streamlit as st
-from dotenv import load_dotenv
 
-# ================== CONFIG ==================
-load_dotenv()  # reads GEMINI_API_KEY from .env if present
+# --- read API key (works on Streamlit Cloud + locally) ---
+GEMINI_API_KEY = None
+# 1) Streamlit Cloud (secrets)
+if "GEMINI_API_KEY" in st.secrets:
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+# 2) local fallback (env var)
+elif os.getenv("GEMINI_API_KEY"):
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    st.error("Missing GEMINI_API_KEY. Add it in Streamlit 'Secrets' or set it as an env var locally.")
+    st.stop()
+
 
 FIXED_ATTRS = ["silhouette","proportion_or_fit","detail","color","print_or_pattern","fabric"]
 ATTR_LABELS = {
