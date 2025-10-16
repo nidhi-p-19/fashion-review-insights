@@ -1,0 +1,22 @@
+# Core libraries
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# LLM APIs
+google-generativeai>=0.5.2
+
+# Optional but recommended (for evaluation + UX)
+tqdm>=4.66.0          # progress bars
+rich>=13.7.0          # better terminal printing
+sentence-transformers>=3.0.0  # embeddings & similarity
+scikit-learn>=1.4.0   # metrics (precision, recall, F1)
+bert-score>=0.3.13    # semantic summary evaluation
+
+
+
+# . .\.venv311\Scripts\Activate.ps1
+
+# pip install -r requirements.txt
+
+
+# streamlit run app_live.py
